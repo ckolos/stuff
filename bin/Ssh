@@ -1,0 +1,112 @@
+#!/bin/bash
+# ssh wrapper, useful for automation/parallelism.  features:
+# - prefixes output with hostname (-q to disable)
+#   \ if stdout is a terminal, colorize hostname
+# - use sane ssh options for batch/non-interactive usage
+# - easily run local scripts on remote hosts
+# - forces command (local & remote) output to be unbuffered
+#
+# notes:
+# - remote command stderr becomes local stdout (to prefix with hostname)
+
+progname=$(basename $0)
+
+usage() {
+    cat <<EOF
+usage: $progname [-q] [-v] [-l user] [-i identity] [user@]host command
+
+Pass "@/path/to/script" as the command to run the local script on
+the remote host.
+EOF
+}
+
+err() {
+    echo "$progname: ""$@" >&2
+}
+
+batch_ssh() {
+    stdbuf -o 0 \
+    ssh -4 -a -x -o "BatchMode yes" -o "ConnectTimeout 5" \
+        -o "StrictHostKeyChecking no" \
+        -o "PreferredAuthentications publickey" \
+        "$@"
+}
+
+prefix=true
+ssh_opts="-oStrictHostKeyChecking=no -oBatchMode=yes"
+while getopts ":qvhl:i:" opt; do
+    case "$opt" in
+        v)
+            ssh_opts="$ssh_opts -$opt"
+            ;;
+        l|i)
+            ssh_opts="$ssh_opts -$opt $OPTARG"
+            ;;
+        q)
+            prefix=false
+            ;;
+        h)
+            usage
+            exit 0
+            ;;
+        *)
+            err "unknown option -$opt"
+            exit 255
+            ;;
+    esac
+done
+
+shift $((OPTIND-1))
+
+host=$1
+shift
+if [ -z "$host" ]; then
+    err "must specify a host"
+    exit 255
+fi
+
+if [ "$host" != "${host##*@}" ]; then
+    ssh_opts="$ssh_opts -l ${host%%@*}"
+    host=${host##*@}
+fi
+
+if [ $# -eq 0 ]; then
+    err "$host: must specify a command"
+    exit 255
+fi
+
+color_prefix=""
+color_suffix=""
+
+if $prefix; then
+    color_prefix=""
+    color_suffix=""
+    if tty -s; then
+        color_prefix="$(tput setaf 5)"
+        color_suffix="$(tput sgr0)"
+    fi
+    prefix_cmd="| stdbuf -o 0 sed -e 's@^@${color_prefix}${host}:${color_suffix} @'"
+else
+    prefix_cmd=""
+fi
+
+if [ "${1:0:1}" = "@" ]; then
+    if [ $# -gt 1 ]; then
+        err "$host: only one @script can be specified"
+        exit 255
+    fi
+
+    file=${1:1}
+    interp="bash"
+    shebang=$(head -n 1 < "$file")
+    if [ "${shebang:0:2}" = "#!" ]; then
+        interp="${shebang:2}"
+    fi
+    batch_ssh $ssh_opts -- $host stdbuf -o 0 "$interp" < "$file" 2>&1 \
+         $prefix_cmd
+    exit ${PIPESTATUS[0]}
+else
+    batch_ssh -n $ssh_opts -- $host stdbuf -o 0 "$@" 2\>\&1 2>&1 \
+         $prefix_cmd
+    exit ${PIPESTATUS[0]}
+fi
